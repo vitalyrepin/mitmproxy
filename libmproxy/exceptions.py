@@ -41,6 +41,10 @@ class HttpException(ProtocolException):
     pass
 
 
+class Http2Exception(ProtocolException):
+    pass
+
+
 class InvalidCredentials(HttpException):
     pass
 
