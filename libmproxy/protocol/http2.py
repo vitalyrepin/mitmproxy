@@ -33,6 +33,21 @@ class Http2Connection(object):
         self.initiated_streams = 0
         self.streams = {}
 
+    def read_frame(self):
+        with self.lock:
+            return Frame.from_file(self.rfile)  # TODO: max_body_size
+
+    def send_frame(self, *frames):
+        """
+        Should only be called with multiple frames that MUST be sent in sequence,
+        e.g. a HEADEDRS frame and its CONTINUATION frames
+        """
+        with self.lock:
+            for frame in frames:
+                print("send frame", self.__class__.__name__, frame.human_readable())
+                self._connection.wfile.write(frame.to_bytes())
+                self._connection.wfile.flush()
+
     def send_headers(self, headers, stream_id, end_stream=False):
         with self.lock:
             if stream_id is None:
@@ -48,19 +63,8 @@ class Http2Connection(object):
         for frame in frames:
             self.send_frame(frame)
 
-    def send_frame(self, *frames):
-        """
-        Should only be called with multiple frames if they MUST be sent in sequence, e.g.
-        a HEADEDRS frame and its CONTINUATION frames
-        """
-        with self.lock:
-            for frame in frames:
-                print("send frame", "debug", self.__class__.__name__, frame.human_readable())
-                self._connection.wfile.write(frame.to_bytes())
-                self._connection.wfile.flush()
-
-    def send(self, *args):
-        raise RuntimeError()
+    def send(self, *args):  # pragma: nocover
+        raise RuntimeError("Must only send frames on a HTTP 2 Connection")
 
     def read_headers(self, headers_frame):
         all_header_frames = self._read_all_header_frames(headers_frame)
@@ -73,8 +77,10 @@ class Http2Connection(object):
     def _read_all_header_frames(self, headers_frame):
         frames = [headers_frame]
         while not frames[-1].flags & Frame.FLAG_END_HEADERS:
+            # This blocks the whole connection if the client does not send header frames,
+            # but that should not matter in practice.
             with self.lock:
-                frame = Frame.from_file(self._connection.rfile)  # TODO: max_body_size
+                frame = self.read_frame()
 
             if not isinstance(frame, ContinuationFrame) or frame.stream_id != frames[-1].stream_id:
                 raise Http2Exception("Unexpected frame: %s" % repr(frame))
@@ -93,7 +99,7 @@ class Http2Connection(object):
 
     def _next_stream_id(self):
         """
-        Gets the next stream id. The caller must hold the lock.
+        Gets the next stream id. The caller must already hold the lock.
         """
         raise NotImplementedError()
 
@@ -141,6 +147,7 @@ class Http2ServerConnection(Http2Connection):
             SettingsFrame.SETTINGS.SETTINGS_INITIAL_WINDOW_SIZE: 2**31 - 1  # yolo flow control (tm)
         })
         self.send_frame(settings_frame)
+
         # yolo flow control (tm)
         window_update_frame = WindowUpdateFrame(stream_id=0, window_size_increment=2**31 - 2**16)
         self.send_frame(window_update_frame)
@@ -168,9 +175,14 @@ class Http2Layer(Layer):
             self.active_conns.append(self.server_conn.connection)
 
     def connect(self):
-        if not self.server_conn:
-            self.server_conn.connect()
-            self.active_conns.append(self.server_conn.connection)
+        self.server_conn.connect()
+        self.active_conns.append(self.server_conn.connection)
+
+    def set_server(self):
+        raise NotImplementedError("Cannot change server for HTTP2 connections.")
+
+    def disconnect(self):
+        raise NotImplementedError("Cannot dis- or reconnect in HTTP2 connections.")
 
     def __call__(self):
         client = self.client_conn
@@ -185,8 +197,7 @@ class Http2Layer(Layer):
                     else:
                         source = server
 
-                    with source.lock:
-                        frame = Frame.from_file(source.rfile)  # TODO: max_body_size
+                    frame = source.read_frame()
                     self.log("receive frame", "debug", (source.__class__.__name__, frame.human_readable()))
 
                     is_new_stream = (
@@ -224,7 +235,7 @@ class Http2Layer(Layer):
                         raise Http2Exception("Unexpected Frame: %s" % frame.human_readable())
 
         finally:
-            self.log("Waiting for streams to finish...")
+            self.log("Waiting for streams to finish...", "debug")
             for stream in self.client_conn.streams.values() + self.server_conn.streams.values():
                 stream.join()
 
@@ -398,7 +409,9 @@ class Stream(_StreamingHttpLayer, threading.Thread):
         self.ctx.client_conn.send_data("", self.client_stream_id, end_stream=True)
 
     def check_close_connection(self, flow):
-        return True  # always close the stream
+        # RFC 7540 8.1
+        # > An HTTP request/response exchange fully consumes a single stream.
+        return True
 
     def run(self):
         layer = HttpLayer(self, "transparent")
