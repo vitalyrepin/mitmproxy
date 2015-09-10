@@ -58,7 +58,7 @@ class Http2Connection(object):
         """
         with self.lock:
             for frame in frames:
-                #print("send frame", self.__class__.__name__, frame.human_readable())
+                print("send frame", "debug", self.__class__.__name__, frame.human_readable())
                 self._connection.wfile.write(frame.to_bytes())
                 self._connection.wfile.flush()
 
@@ -76,7 +76,8 @@ class Http2Connection(object):
     def _read_all_header_frames(self, headers_frame):
         frames = [headers_frame]
         while not frames[-1].flags & Frame.FLAG_END_HEADERS:
-            frame = Frame.from_file(self._connection.rfile)  # TODO: max_body_size
+            with self.lock:
+                frame = Frame.from_file(self._connection.rfile)  # TODO: max_body_size
 
             if not isinstance(frame, ContinuationFrame) or frame.stream_id != frames[-1].stream_id:
                 raise Http2Exception("Unexpected frame: %s" % repr(frame))
@@ -185,7 +186,7 @@ class Http2Layer(Layer):
 
                 with source.lock:
                     frame = Frame.from_file(source.rfile)  # TODO: max_body_size
-                #print("receive frame", source.__class__.__name__, frame.human_readable())
+                self.log("receive frame", "debug", (source.__class__.__name__, frame.human_readable()))
 
                 is_new_stream = (
                     isinstance(frame, HeadersFrame) and
@@ -369,7 +370,7 @@ class Stream(_StreamingHttpLayer, threading.Thread):
         )
 
     def read_response_body(self, headers, request_method, response_code, max_chunk_size=None):
-        return HTTP1Protocol(rfile=self.server_conn.rfile).read_http_body(
+        return HTTP1Protocol(rfile=self.server_conn.rfile).read_http_body_chunked(
             headers,
             self.config.body_size_limit,
             request_method,
@@ -381,12 +382,14 @@ class Stream(_StreamingHttpLayer, threading.Thread):
         self.ctx.client_conn.send_headers(
             response.headers,
             self.client_stream_id,
-            end_stream=not response.body
+            end_stream=False
         )
 
     def send_response_body(self, response, chunks):
-        if response.body:
-            self.ctx.client_conn.send_data(response.body, self.client_stream_id, end_stream=True)
+        if chunks:
+            for chunk in chunks:
+                self.ctx.client_conn.send_data(chunk, self.client_stream_id, end_stream=False)
+        self.ctx.client_conn.send_data("", self.client_stream_id, end_stream=True)
 
     def check_close_connection(self, flow):
         return True  # always close the stream
