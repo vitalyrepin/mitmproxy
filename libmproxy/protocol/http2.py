@@ -245,27 +245,10 @@ class Http2Layer(Layer):
             stream.into_server_conn.shutdown(socket.SHUT_WR)
 
 
-class FakeWFile(object):
-
-    # TODO: Implement .close().
-
-    def __init__(self, send_func):
-        self.buf = BytesIO()
-        self.send_func = send_func
-
-    def write(self, b):
-        self.buf.write(b)
-
-    def flush(self):
-        self.send_func(self.buf.getvalue())
-        self.buf = BytesIO()
-
-
 class StreamConnection(object):
-    def __init__(self, original_connection, connection, send_func):
+    def __init__(self, original_connection, connection):
         self.original_connection = original_connection
         self.rfile = Reader(connection.makefile('rb', -1))
-        self.wfile = FakeWFile(send_func)
 
     @property
     def address(self):
@@ -287,9 +270,9 @@ class Stream(_StreamingHttpLayer, threading.Thread):
         self.stream_id = stream_id
 
         a, b = socket.socketpair()
-        self.client_conn = StreamConnection(self.ctx.client_conn, a, self._write_data_client)
+        self.client_conn = StreamConnection(self.ctx.client_conn, a)
         self.into_client_conn = b
-        self.server_conn = StreamConnection(self.ctx.server_conn, b, self._write_data_server)
+        self.server_conn = StreamConnection(self.ctx.server_conn, b)
         self.into_server_conn = a
 
         self.client_headers = Queue()
@@ -386,12 +369,6 @@ class Stream(_StreamingHttpLayer, threading.Thread):
     def send_response_body(self, response, chunks):
         if response.body:
             self.ctx.client_conn.send_data(response.body, self.stream_id, end_stream=True)
-
-    def _write_data_client(self, data):
-        self.ctx.client_conn.send_data(data, self.stream_id, end_stream=False)
-
-    def _write_data_server(self, data):
-        self.ctx.server_conn.send_data(data, self.stream_id, end_stream=False)
 
     def run(self):
         layer = HttpLayer(self, "transparent")
