@@ -23,6 +23,7 @@ deps = {
     "html2text>=2015.4.14",
     "construct>=2.5.2",
     "six>=1.9.0",
+    "backports.socketpair>=3.5.0.2",
 }
 # A script -> additional dependencies dict.
 scripts = {

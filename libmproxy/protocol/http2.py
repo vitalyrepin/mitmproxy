@@ -3,7 +3,6 @@ from Queue import Queue
 import select
 import socket
 import threading
-from io import BytesIO
 
 from hpack.hpack import Encoder, Decoder
 import backports.socketpair
@@ -13,8 +12,8 @@ from netlib.http import Headers
 from netlib.http.http1 import HTTP1Protocol
 from netlib.http.http2 import Frame, HeadersFrame, ContinuationFrame, DataFrame, HTTP2Protocol, \
     SettingsFrame, WindowUpdateFrame
-from netlib.tcp import Reader
-from ..exceptions import Http2Exception
+from netlib.tcp import Reader, ssl_read_select
+from ..exceptions import Http2Exception, ProtocolException
 from .base import Layer
 from .http import _StreamingHttpLayer, HttpLayer
 
@@ -28,13 +27,13 @@ class Http2Connection(object):
     def __init__(self, connection):
         self.encoder = Encoder()
         self.decoder = Decoder()
-        self.write_lock = threading.RLock()
+        self.lock = threading.RLock()
         self.via = connection
         if self.via:
             self.preface()
 
     def send_headers(self, headers, stream_id, end_stream=False):
-        with self.write_lock:
+        with self.lock:
             proto = HTTP2Protocol(encoder=self.encoder)
             frames = proto._create_headers(headers, stream_id, end_stream)
             self.send_frame(*frames)
@@ -50,7 +49,7 @@ class Http2Connection(object):
         Should only be called with multiple frames if they MUST be send in sequence.
         """
         # TODO: Should be frames, not chunks
-        with self.write_lock:
+        with self.lock:
             for frame in frames:
                 print("send frame", self.__class__.__name__, frame.human_readable())
                 self.via.wfile.write(frame.to_bytes())
@@ -156,17 +155,35 @@ class Http2Layer(Layer):
         # - no: We want server replay without connecting upstream.
         # self.connect()
 
-        client = self.client_conn
+        """
+        def t():
+            while True:
+                r, _, _ = select.select([
+                    self.client_conn.connection,
+                    self.client_conn.connection._socket,
+                    self.server_conn.connection,
+                    self.server_conn.connection._socket,
+                ], [], [], 0.01)
+                print(r, self.client_conn.connection.pending(), self.server_conn.connection.pending())
+                import time
+                time.sleep(0.5)
+        threading.Thread(target=t).start()
+        """
 
+        client = self.client_conn
         while True:
-            r, _, _ = select.select(self.active_conns, [], [], 10)
+            print("sel")
+            r = ssl_read_select(self.active_conns, 10)
+            print("sel end", r)
             for conn in r:
                 if conn == client.connection:
                     source = self.client_conn
                 else:
                     source = self.server_conn
 
-                frame = Frame.from_file(source.rfile)  # TODO: max_body_size
+                print("start read", source.__class__.__name__)
+                with source.lock:
+                    frame = Frame.from_file(source.rfile)  # TODO: max_body_size
                 print("receive frame", source.__class__.__name__, frame.human_readable())
 
                 is_new_stream = (
@@ -372,4 +389,8 @@ class Stream(_StreamingHttpLayer, threading.Thread):
 
     def run(self):
         layer = HttpLayer(self, "transparent")
-        layer()
+        try:
+            layer()
+        except ProtocolException as e:
+            self.log(e, "info")
+            # TODO: Send RST_STREAM?
