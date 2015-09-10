@@ -1,6 +1,5 @@
 from __future__ import (absolute_import, print_function, division)
 from Queue import Queue
-import select
 import socket
 import threading
 
@@ -33,8 +32,6 @@ class Http2Connection(object):
 
         self.initiated_streams = 0
         self.streams = {}
-        if self._connection:
-            self.preface()
 
     def send_headers(self, headers, stream_id, end_stream=False):
         with self.lock:
@@ -161,7 +158,10 @@ class Http2Layer(Layer):
             raise NotImplementedError("HTTP2 supports transparent mode only")
 
         self.client_conn = Http2ClientConnection(self.client_conn)
+        self.client_conn.preface()
         self.server_conn = Http2ServerConnection(self.server_conn)
+        if self.server_conn:
+            self.server_conn.preface()
 
         self.active_conns = [self.client_conn.connection]
         if self.server_conn:
@@ -176,51 +176,58 @@ class Http2Layer(Layer):
         client = self.client_conn
         server = self.server_conn
 
-        while True:
-            r = ssl_read_select(self.active_conns, 10)
-            for conn in r:
-                if conn == client.connection:
-                    source = client
-                else:
-                    source = server
+        try:
+            while True:
+                r = ssl_read_select(self.active_conns, 10)
+                for conn in r:
+                    if conn == client.connection:
+                        source = client
+                    else:
+                        source = server
 
-                with source.lock:
-                    frame = Frame.from_file(source.rfile)  # TODO: max_body_size
-                self.log("receive frame", "debug", (source.__class__.__name__, frame.human_readable()))
+                    with source.lock:
+                        frame = Frame.from_file(source.rfile)  # TODO: max_body_size
+                    self.log("receive frame", "debug", (source.__class__.__name__, frame.human_readable()))
 
-                is_new_stream = (
-                    isinstance(frame, HeadersFrame) and
-                    source == client and
-                    frame.stream_id not in source.streams
-                )
-                is_server_headers = (
-                    isinstance(frame, HeadersFrame) and
-                    source == server and
-                    frame.stream_id in source.streams
-                )
-                is_data_frame = (
-                    isinstance(frame, DataFrame) and
-                    frame.stream_id in source.streams
-                )
-                is_settings_frame = (
-                    isinstance(frame, SettingsFrame) and
-                    frame.stream_id == 0
-                )
-                is_window_update_frame = (
-                    isinstance(frame, WindowUpdateFrame)
-                )
-                if is_new_stream:
-                    self._create_new_stream(frame, source)
-                elif is_server_headers:
-                    self._process_server_headers(frame, source)
-                elif is_data_frame:
-                    self._process_data_frame(frame, source)
-                elif is_settings_frame:
-                    self._process_settings_frame(frame, source)
-                elif is_window_update_frame:
-                    self._process_window_update_frame(frame)
-                else:
-                    raise Http2Exception("Unexpected Frame: %s" % frame.human_readable())
+                    is_new_stream = (
+                        isinstance(frame, HeadersFrame) and
+                        source == client and
+                        frame.stream_id not in source.streams
+                    )
+                    is_server_headers = (
+                        isinstance(frame, HeadersFrame) and
+                        source == server and
+                        frame.stream_id in source.streams
+                    )
+                    is_data_frame = (
+                        isinstance(frame, DataFrame) and
+                        frame.stream_id in source.streams
+                    )
+                    is_settings_frame = (
+                        isinstance(frame, SettingsFrame) and
+                        frame.stream_id == 0
+                    )
+                    is_window_update_frame = (
+                        isinstance(frame, WindowUpdateFrame)
+                    )
+                    if is_new_stream:
+                        self._create_new_stream(frame, source)
+                    elif is_server_headers:
+                        self._process_server_headers(frame, source)
+                    elif is_data_frame:
+                        self._process_data_frame(frame, source)
+                    elif is_settings_frame:
+                        self._process_settings_frame(frame, source)
+                    elif is_window_update_frame:
+                        self._process_window_update_frame(frame)
+                    else:
+                        raise Http2Exception("Unexpected Frame: %s" % frame.human_readable())
+
+        finally:
+            self.log("Waiting for streams to finish...")
+            for stream in self.client_conn.streams.values() + self.server_conn.streams.values():
+                stream.join()
+
 
     def _process_window_update_frame(self, window_update_frame):
         pass  # yolo flow control (tm)
