@@ -28,15 +28,17 @@ class Http2Connection(object):
         self.encoder = Encoder()
         self.decoder = Decoder()
         self.lock = threading.RLock()
-        self.via = connection
+
+        self._connection = connection
+
         self.initiated_streams = 0
-        if self.via:
+        if self._connection:
             self.preface()
 
     def send_headers(self, headers, stream_id, end_stream=False):
         with self.lock:
             if stream_id is None:
-                stream_id = self.next_stream_id()
+                stream_id = self._next_stream_id()
             proto = HTTP2Protocol(encoder=self.encoder)
             frames = proto._create_headers(headers, stream_id, end_stream)
             self.send_frame(*frames)
@@ -50,14 +52,14 @@ class Http2Connection(object):
 
     def send_frame(self, *frames):
         """
-        Should only be called with multiple frames if they MUST be send in sequence.
+        Should only be called with multiple frames if they MUST be sent in sequence, e.g.
+        a HEADEDRS frame and its CONTINUATION frames
         """
-        # TODO: Should be frames, not chunks
         with self.lock:
             for frame in frames:
-                print("send frame", self.__class__.__name__, frame.human_readable())
-                self.via.wfile.write(frame.to_bytes())
-                self.via.wfile.flush()
+                #print("send frame", self.__class__.__name__, frame.human_readable())
+                self._connection.wfile.write(frame.to_bytes())
+                self._connection.wfile.flush()
 
     def send(self, *args):
         raise RuntimeError()
@@ -73,7 +75,7 @@ class Http2Connection(object):
     def _read_all_header_frames(self, headers_frame):
         frames = [headers_frame]
         while not frames[-1].flags & Frame.FLAG_END_HEADERS:
-            frame = Frame.from_file(self.via.rfile)  # TODO: max_body_size
+            frame = Frame.from_file(self._connection.rfile)  # TODO: max_body_size
 
             if not isinstance(frame, ContinuationFrame) or frame.stream_id != frames[-1].stream_id:
                 raise Http2Exception("Unexpected frame: %s" % repr(frame))
@@ -82,15 +84,18 @@ class Http2Connection(object):
         return frames
 
     def __nonzero__(self):
-        return bool(self.via)
+        return bool(self._connection)
 
     def __getattr__(self, item):
-        return getattr(self.via, item)
+        return getattr(self._connection, item)
 
     def preface(self):
         raise NotImplementedError()
 
-    def next_stream_id(self):
+    def _next_stream_id(self):
+        """
+        Gets the next stream id. The caller must hold the lock.
+        """
         raise NotImplementedError()
 
 
@@ -98,7 +103,7 @@ class Http2ClientConnection(Http2Connection):
     def preface(self):
         # Check Client Preface
         expected_client_preface = CLIENT_CONNECTION_PREFACE
-        actual_client_preface = self.via.rfile.read(len(CLIENT_CONNECTION_PREFACE))
+        actual_client_preface = self._connection.rfile.read(len(CLIENT_CONNECTION_PREFACE))
         if expected_client_preface != actual_client_preface:
             raise Http2Exception("Invalid Client preface: %s" % actual_client_preface)
 
@@ -113,21 +118,22 @@ class Http2ClientConnection(Http2Connection):
         window_update_frame = WindowUpdateFrame(stream_id=0, window_size_increment=2**31 - 2**16)
         self.send_frame(window_update_frame)
 
-    def next_stream_id(self):
-        # this must be called while holding the lock.
+    def _next_stream_id(self):
         self.initiated_streams += 1
         # RFC 7540 5.1.1: stream 0x1 cannot be selected as a new stream identifier
         # by a client that upgrades from HTTP/1.1.
         return self.initiated_streams * 2
 
+
 class Http2ServerConnection(Http2Connection):
     def connect(self):
-        self.via.connect()
-        self.preface()
+        with self.lock:
+            self._connection.connect()
+            self.preface()
 
     def preface(self):
-        self.via.wfile.write(CLIENT_CONNECTION_PREFACE)
-        self.via.wfile.flush()
+        self._connection.wfile.write(CLIENT_CONNECTION_PREFACE)
+        self._connection.wfile.flush()
 
         # Send Settings Frame
         settings_frame = SettingsFrame(settings={
@@ -140,8 +146,7 @@ class Http2ServerConnection(Http2Connection):
         window_update_frame = WindowUpdateFrame(stream_id=0, window_size_increment=2**31 - 2**16)
         self.send_frame(window_update_frame)
 
-    def next_stream_id(self):
-        # this must be called while holding the lock.
+    def _next_stream_id(self):
         self.initiated_streams += 1
         return self.initiated_streams * 2 + 1
 
@@ -168,38 +173,20 @@ class Http2Layer(Layer):
             self.active_conns.append(self.server_conn.connection)
 
     def __call__(self):
-        # TODO: Do we want to connect to the server default?
-        # - yes: We may just connect and receive interesting PUSH_PROMISES
-        # - no: We want server replay without connecting upstream.
-        # self.connect()
-
-        """
-        def t():
-            while True:
-                r, _, _ = select.select([
-                    self.client_conn.connection,
-                    self.client_conn.connection._socket,
-                    self.server_conn.connection,
-                    self.server_conn.connection._socket,
-                ], [], [], 0.01)
-                print(r, self.client_conn.connection.pending(), self.server_conn.connection.pending())
-                import time
-                time.sleep(0.5)
-        threading.Thread(target=t).start()
-        """
-
         client = self.client_conn
+        server = self.server_conn
+
         while True:
             r = ssl_read_select(self.active_conns, 10)
             for conn in r:
                 if conn == client.connection:
-                    source = self.client_conn
+                    source = client
                 else:
-                    source = self.server_conn
+                    source = server
 
                 with source.lock:
                     frame = Frame.from_file(source.rfile)  # TODO: max_body_size
-                print("receive frame", source.__class__.__name__, frame.human_readable())
+                #print("receive frame", source.__class__.__name__, frame.human_readable())
 
                 is_new_stream = (
                     isinstance(frame, HeadersFrame) and
@@ -208,7 +195,7 @@ class Http2Layer(Layer):
                 )
                 is_server_headers = (
                     isinstance(frame, HeadersFrame) and
-                    source != client and
+                    source == server and
                     (source, frame.stream_id) in self.streams
                 )
                 is_data_frame = (
