@@ -32,6 +32,7 @@ class Http2Connection(object):
         self._connection = connection
 
         self.initiated_streams = 0
+        self.streams = {}
         if self._connection:
             self.preface()
 
@@ -165,8 +166,6 @@ class Http2Layer(Layer):
         if self.server_conn:
             self.active_conns.append(self.server_conn.connection)
 
-        self.streams = {}
-
     def connect(self):
         if not self.server_conn:
             self.server_conn.connect()
@@ -191,16 +190,16 @@ class Http2Layer(Layer):
                 is_new_stream = (
                     isinstance(frame, HeadersFrame) and
                     source == client and
-                    (source, frame.stream_id) not in self.streams
+                    frame.stream_id not in source.streams
                 )
                 is_server_headers = (
                     isinstance(frame, HeadersFrame) and
                     source == server and
-                    (source, frame.stream_id) in self.streams
+                    frame.stream_id in source.streams
                 )
                 is_data_frame = (
                     isinstance(frame, DataFrame) and
-                    (source, frame.stream_id) in self.streams
+                    frame.stream_id in source.streams
                 )
                 is_settings_frame = (
                     isinstance(frame, SettingsFrame) and
@@ -234,8 +233,8 @@ class Http2Layer(Layer):
             source.send_frame(settings_ack_frame)
 
     def _process_data_frame(self, data_frame, source):
-        stream = self.streams[(source, data_frame.stream_id)]
-        if source == self.client_conn.connection:
+        stream = source.streams[data_frame.stream_id]
+        if source == self.client_conn:
             target = stream.into_client_conn
         else:
             target = stream.into_server_conn
@@ -248,7 +247,7 @@ class Http2Layer(Layer):
     def _create_new_stream(self, headers_frame, source):
         header_frames, headers = self.client_conn.read_headers(headers_frame)
         stream = Stream(self, headers_frame.stream_id)
-        self.streams[(source, headers_frame.stream_id)] = stream
+        source.streams[headers_frame.stream_id] = stream
         stream.start()
 
         stream.client_headers.put(headers)
@@ -257,7 +256,7 @@ class Http2Layer(Layer):
 
     def _process_server_headers(self, headers_frame, source):
         header_frames, headers = self.server_conn.read_headers(headers_frame)
-        stream = self.streams[(source, headers_frame.stream_id)]
+        stream = source.streams[headers_frame.stream_id]
 
         stream.server_headers.put(headers)
         if header_frames[-1].flags & Frame.FLAG_END_STREAM:
@@ -344,12 +343,9 @@ class Stream(_StreamingHttpLayer, threading.Thread):
             end_stream=not request.body
         )
         # TODO: This feels like the wrong place for registering.
-        self.streams[(self.ctx.server_conn, self.server_stream_id)] = self
+        self.ctx.server_conn.streams[self.server_stream_id] = self
         if request.body:
             self.ctx.server_conn.send_data(request.body, self.server_stream_id, end_stream=True)
-
-    def check_close_connection(self, flow):
-        return True  # always close the stream
 
     def read_response_headers(self):
 
@@ -391,6 +387,9 @@ class Stream(_StreamingHttpLayer, threading.Thread):
     def send_response_body(self, response, chunks):
         if response.body:
             self.ctx.client_conn.send_data(response.body, self.client_stream_id, end_stream=True)
+
+    def check_close_connection(self, flow):
+        return True  # always close the stream
 
     def run(self):
         layer = HttpLayer(self, "transparent")
