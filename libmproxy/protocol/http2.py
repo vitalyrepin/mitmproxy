@@ -240,9 +240,12 @@ class Http2Layer(Layer):
         else:
             target = stream.into_server_conn
 
-        target.sendall(data_frame.payload)
+        if len(data_frame.payload) > 0:
+            chunk = "{:x}\r\n{}\r\n".format(len(data_frame.payload), data_frame.payload)
+            target.sendall(chunk)
 
         if data_frame.flags & Frame.FLAG_END_STREAM:
+            target.sendall("0\r\n\r\n")
             target.shutdown(socket.SHUT_WR)
 
     def _create_new_stream(self, headers_frame, source):
@@ -370,12 +373,8 @@ class Stream(_StreamingHttpLayer, threading.Thread):
         )
 
     def read_response_body(self, headers, request_method, response_code, max_chunk_size=None):
-        return HTTP1Protocol(rfile=self.server_conn.rfile).read_http_body_chunked(
-            headers,
-            self.config.body_size_limit,
-            request_method,
-            response_code,
-            False
+        return HTTP1Protocol(rfile=self.server_conn.rfile)._read_chunked(
+            self.config.body_size_limit, False
         )
 
     def send_response_headers(self, response):
