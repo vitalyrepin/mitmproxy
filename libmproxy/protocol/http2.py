@@ -29,14 +29,18 @@ class Http2Connection(object):
         self.decoder = Decoder()
         self.lock = threading.RLock()
         self.via = connection
+        self.initiated_streams = 0
         if self.via:
             self.preface()
 
     def send_headers(self, headers, stream_id, end_stream=False):
         with self.lock:
+            if stream_id is None:
+                stream_id = self.next_stream_id()
             proto = HTTP2Protocol(encoder=self.encoder)
             frames = proto._create_headers(headers, stream_id, end_stream)
             self.send_frame(*frames)
+            return stream_id
 
     def send_data(self, data, stream_id, end_stream=False):
         proto = HTTP2Protocol()
@@ -86,6 +90,9 @@ class Http2Connection(object):
     def preface(self):
         raise NotImplementedError()
 
+    def next_stream_id(self):
+        raise NotImplementedError()
+
 
 class Http2ClientConnection(Http2Connection):
     def preface(self):
@@ -97,7 +104,7 @@ class Http2ClientConnection(Http2Connection):
 
         # Send Settings Frame
         settings_frame = SettingsFrame(settings={
-            SettingsFrame.SETTINGS.SETTINGS_MAX_CONCURRENT_STREAMS: 100,
+            SettingsFrame.SETTINGS.SETTINGS_MAX_CONCURRENT_STREAMS: 50,
             SettingsFrame.SETTINGS.SETTINGS_INITIAL_WINDOW_SIZE: 2**31 - 1  # yolo flow control (tm)
         })
         self.send_frame(settings_frame)
@@ -106,6 +113,12 @@ class Http2ClientConnection(Http2Connection):
         window_update_frame = WindowUpdateFrame(stream_id=0, window_size_increment=2**31 - 2**16)
         self.send_frame(window_update_frame)
 
+    def next_stream_id(self):
+        # this must be called while holding the lock.
+        self.initiated_streams += 1
+        # RFC 7540 5.1.1: stream 0x1 cannot be selected as a new stream identifier
+        # by a client that upgrades from HTTP/1.1.
+        return self.initiated_streams * 2
 
 class Http2ServerConnection(Http2Connection):
     def connect(self):
@@ -119,13 +132,18 @@ class Http2ServerConnection(Http2Connection):
         # Send Settings Frame
         settings_frame = SettingsFrame(settings={
             SettingsFrame.SETTINGS.SETTINGS_ENABLE_PUSH: 0,
-            SettingsFrame.SETTINGS.SETTINGS_MAX_CONCURRENT_STREAMS: 100,
+            SettingsFrame.SETTINGS.SETTINGS_MAX_CONCURRENT_STREAMS: 50,
             SettingsFrame.SETTINGS.SETTINGS_INITIAL_WINDOW_SIZE: 2**31 - 1  # yolo flow control (tm)
         })
         self.send_frame(settings_frame)
         # yolo flow control (tm)
         window_update_frame = WindowUpdateFrame(stream_id=0, window_size_increment=2**31 - 2**16)
         self.send_frame(window_update_frame)
+
+    def next_stream_id(self):
+        # this must be called while holding the lock.
+        self.initiated_streams += 1
+        return self.initiated_streams * 2 + 1
 
 
 class Http2Layer(Layer):
@@ -172,16 +190,13 @@ class Http2Layer(Layer):
 
         client = self.client_conn
         while True:
-            print("sel")
             r = ssl_read_select(self.active_conns, 10)
-            print("sel end", r)
             for conn in r:
                 if conn == client.connection:
                     source = self.client_conn
                 else:
                     source = self.server_conn
 
-                print("start read", source.__class__.__name__)
                 with source.lock:
                     frame = Frame.from_file(source.rfile)  # TODO: max_body_size
                 print("receive frame", source.__class__.__name__, frame.human_readable())
@@ -189,16 +204,16 @@ class Http2Layer(Layer):
                 is_new_stream = (
                     isinstance(frame, HeadersFrame) and
                     source == client and
-                    frame.stream_id not in self.streams
+                    (source, frame.stream_id) not in self.streams
                 )
                 is_server_headers = (
                     isinstance(frame, HeadersFrame) and
                     source != client and
-                    frame.stream_id in self.streams
+                    (source, frame.stream_id) in self.streams
                 )
                 is_data_frame = (
                     isinstance(frame, DataFrame) and
-                    frame.stream_id in self.streams
+                    (source, frame.stream_id) in self.streams
                 )
                 is_settings_frame = (
                     isinstance(frame, SettingsFrame) and
@@ -208,9 +223,9 @@ class Http2Layer(Layer):
                     isinstance(frame, WindowUpdateFrame)
                 )
                 if is_new_stream:
-                    self._create_new_stream(frame)
+                    self._create_new_stream(frame, source)
                 elif is_server_headers:
-                    self._process_server_headers(frame)
+                    self._process_server_headers(frame, source)
                 elif is_data_frame:
                     self._process_data_frame(frame, source)
                 elif is_settings_frame:
@@ -218,7 +233,7 @@ class Http2Layer(Layer):
                 elif is_window_update_frame:
                     self._process_window_update_frame(frame)
                 else:
-                    raise Http2Exception("Unexpected Frame: %s" % repr(frame))
+                    raise Http2Exception("Unexpected Frame: %s" % frame.human_readable())
 
     def _process_window_update_frame(self, window_update_frame):
         pass  # yolo flow control (tm)
@@ -232,7 +247,7 @@ class Http2Layer(Layer):
             source.send_frame(settings_ack_frame)
 
     def _process_data_frame(self, data_frame, source):
-        stream = self.streams[data_frame.stream_id]
+        stream = self.streams[(source, data_frame.stream_id)]
         if source == self.client_conn.connection:
             target = stream.into_client_conn
         else:
@@ -243,19 +258,19 @@ class Http2Layer(Layer):
         if data_frame.flags & Frame.FLAG_END_STREAM:
             target.shutdown(socket.SHUT_WR)
 
-    def _create_new_stream(self, headers_frame):
+    def _create_new_stream(self, headers_frame, source):
         header_frames, headers = self.client_conn.read_headers(headers_frame)
         stream = Stream(self, headers_frame.stream_id)
-        self.streams[headers_frame.stream_id] = stream
+        self.streams[(source, headers_frame.stream_id)] = stream
         stream.start()
 
         stream.client_headers.put(headers)
         if header_frames[-1].flags & Frame.FLAG_END_STREAM:
             stream.into_client_conn.shutdown(socket.SHUT_WR)
 
-    def _process_server_headers(self, headers_frame):
+    def _process_server_headers(self, headers_frame, source):
         header_frames, headers = self.server_conn.read_headers(headers_frame)
-        stream = self.streams[headers_frame.stream_id]
+        stream = self.streams[(source, headers_frame.stream_id)]
 
         stream.server_headers.put(headers)
         if header_frames[-1].flags & Frame.FLAG_END_STREAM:
@@ -281,10 +296,11 @@ class StreamConnection(object):
 
 class Stream(_StreamingHttpLayer, threading.Thread):
 
-    def __init__(self, ctx, stream_id):
+    def __init__(self, ctx, client_stream_id):
         super(Stream, self).__init__(ctx)
 
-        self.stream_id = stream_id
+        self.client_stream_id = client_stream_id
+        self.server_stream_id = None
 
         a, b = socket.socketpair()
         self.client_conn = StreamConnection(self.ctx.client_conn, a)
@@ -335,13 +351,15 @@ class Stream(_StreamingHttpLayer, threading.Thread):
 
     def send_request(self, request):
         # TODO: The end_stream stuff is too simple for a CONNECT request.
-        self.ctx.server_conn.send_headers(
+        self.server_stream_id = self.ctx.server_conn.send_headers(
             request.headers,
-            self.stream_id,
+            None,
             end_stream=not request.body
         )
+        # TODO: This feels like the wrong place for registering.
+        self.streams[(self.ctx.server_conn, self.server_stream_id)] = self
         if request.body:
-            self.ctx.server_conn.send_data(request.body, self.stream_id, end_stream=True)
+            self.ctx.server_conn.send_data(request.body, self.server_stream_id, end_stream=True)
 
     def check_close_connection(self, flow):
         return True  # always close the stream
@@ -379,13 +397,13 @@ class Stream(_StreamingHttpLayer, threading.Thread):
     def send_response_headers(self, response):
         self.ctx.client_conn.send_headers(
             response.headers,
-            self.stream_id,
+            self.client_stream_id,
             end_stream=not response.body
         )
 
     def send_response_body(self, response, chunks):
         if response.body:
-            self.ctx.client_conn.send_data(response.body, self.stream_id, end_stream=True)
+            self.ctx.client_conn.send_data(response.body, self.client_stream_id, end_stream=True)
 
     def run(self):
         layer = HttpLayer(self, "transparent")
