@@ -344,19 +344,7 @@ class Stream(_StreamingHttpLayer, threading.Thread):
             self.ctx.server_conn.send_data(request.body, self.stream_id, end_stream=True)
 
     def check_close_connection(self, flow):
-        return True
-
-    def read_response(self, request_method):
-        raise NotImplementedError()
-
-    def send_response(self, response):
-        self.ctx.client_conn.send_headers(
-            response.headers,
-            self.stream_id,
-            end_stream=not response.body
-        )
-        if response.body:
-            self.ctx.client_conn.send_data(response.body, self.stream_id, end_stream=True)
+        return True  # always close the stream
 
     def read_response_headers(self):
 
@@ -388,11 +376,16 @@ class Stream(_StreamingHttpLayer, threading.Thread):
             False
         )
 
-    def send_response_body(self, response, chunks):
-        raise NotImplementedError()
-
     def send_response_headers(self, response):
-        raise NotImplementedError()
+        self.ctx.client_conn.send_headers(
+            response.headers,
+            self.stream_id,
+            end_stream=not response.body
+        )
+
+    def send_response_body(self, response, chunks):
+        if response.body:
+            self.ctx.client_conn.send_data(response.body, self.stream_id, end_stream=True)
 
     def _write_data_client(self, data):
         self.ctx.client_conn.send_data(data, self.stream_id, end_stream=False)
