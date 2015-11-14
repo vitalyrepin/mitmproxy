@@ -529,7 +529,9 @@ class TestProxy(tservers.HTTPProxTest):
         connection.send(
             "GET http://localhost:%d/p/304:b@1k HTTP/1.1\r\n" %
             self.server.port)
+        a = time.time()
         time.sleep(1)
+        b = time.time()
         connection.send("\r\n")
         connection.recv(50000)
         connection.close()
@@ -539,7 +541,7 @@ class TestProxy(tservers.HTTPProxTest):
         assert response.status_code == 304  # sanity test for our low level request
         # time.sleep might be a little bit shorter than a second,
         # we observed up to 0.93s on appveyor.
-        assert 0.8 < (request.timestamp_end - request.timestamp_start)
+        assert a and b and 0.8 < (request.timestamp_end - request.timestamp_start)
 
     def test_request_tcp_setup_timestamp_presence(self):
         # tests that the client_conn a tcp connection has a tcp_setup_timestamp
